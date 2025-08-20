@@ -15,6 +15,14 @@ const (
 	TransientQueueType simpleQueueType = "transient"
 )
 
+type Acktype int64
+
+const (
+	Ack Acktype = iota
+	NackRequeue
+	NackDiscard
+)
+
 func PublishJSON[T any](ch *amqp.Channel, exchange, key string, val T) error {
 	data, err := json.Marshal(val)
 	if err != nil {
@@ -47,4 +55,45 @@ func DeclareAndBind(conn *amqp.Connection, exchange, queueName, key string, queu
 		return nil, amqp.Queue{}, fmt.Errorf("error while binding queue: %v", err)
 	}
 	return ampqChan, queue, nil
+}
+
+func SubscribeJSON[T any](conn *amqp.Connection,
+	exchange,
+	queueName,
+	key string,
+	queueType simpleQueueType, // an enum to represent "durable" or "transient"
+	handler func(T) Acktype,
+) error {
+	ch, q, err := DeclareAndBind(conn, exchange, queueName, key, queueType)
+	if err != nil {
+		return err
+	}
+	deliChan, err := ch.Consume(q.Name, "", false, false, false, false, amqp.Table{})
+	if err != nil {
+		return err
+	}
+	go func() {
+		for d := range deliChan {
+			var msg T
+			if err := json.Unmarshal(d.Body, &msg); err == nil {
+				ack := handler(msg)
+				switch ack {
+				case Ack:
+					fmt.Println("Message processed successfully")
+					d.Ack(false)
+				case NackRequeue:
+					fmt.Println("Message not processed successfully, but should be requeued on the same queue to be processed again (retry).")
+					d.Nack(false, true)
+				case NackDiscard:
+					fmt.Println("Message not processed successfully, and should be discarded (to a dead-letter queue if configured or just deleted entirely).")
+					d.Nack(false, false)
+				}
+				d.Ack(false)
+			} else {
+				d.Nack(false, false)
+			}
+		}
+	}()
+
+	return nil
 }
